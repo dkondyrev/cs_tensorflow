@@ -1,0 +1,144 @@
+diff --git a/.bazelrc b/.bazelrc
+index d5d2030..c27c68e 100644
+--- a/.bazelrc
++++ b/.bazelrc
+@@ -86,3 +86,4 @@ build --define=LIBDIR=$(PREFIX)/lib
+ build --define=INCLUDEDIR=$(PREFIX)/include
+ 
+ # Do not commit the tf_configure.bazelrc line
++import %workspace%/.tf_configure.bazelrc
+diff --git a/tensorflow/compiler/xla/service/cpu/ir_emitter.cc b/tensorflow/compiler/xla/service/cpu/ir_emitter.cc
+index b2abdb3..ea192be 100644
+--- a/tensorflow/compiler/xla/service/cpu/ir_emitter.cc
++++ b/tensorflow/compiler/xla/service/cpu/ir_emitter.cc
+@@ -70,6 +70,9 @@ limitations under the License.
+ #include "tensorflow/core/lib/core/bits.h"
+ #include "tensorflow/core/lib/core/errors.h"
+ 
++// #include "tensorflow/compiler/xla/primitive_util.h"
++#include "absl/strings/ascii.h"
++
+ namespace xla {
+ 
+ namespace {
+@@ -127,6 +130,27 @@ StatusOr<llvm::Function*> IrEmitter::EmitComputation(
+         assignment_.GetUniqueTopLevelSlice(computation->root_instruction()));
+   }
+ 
++  absl::StrAppend(&wasm_code, "(func (export \"", function_name, "\")");
++
++  for (int i = 0; i < computation->num_parameters(); ++i) {
++    HloInstruction* instruction = computation->parameter_instruction(i);
++    auto type = PrimitiveType_Name(instruction->shape().element_type());
++    if (ShapeUtil::IsScalar(instruction->shape())) {
++      absl::StrAppend(&wasm_code, " (param $", instruction->name(), " ", type, ")");
++    } else {
++      absl::StrAppend(&wasm_code, " (param $", instruction->name(), " i32)");
++    }
++  }
++
++  HloInstruction* root_instruction = computation->root_instruction();
++  auto shape = root_instruction->shape();
++  if (ShapeUtil::IsScalar(shape)) {
++    auto type = PrimitiveType_Name(shape.element_type());
++    absl::StrAppend(&wasm_code, " (result ", absl::AsciiStrToLower(type), ")\n");
++  } else {
++    absl::StrAppend(&wasm_code, " (result i32)\n");
++  }
++
+   for (const HloInstruction* param : computation->parameter_instructions()) {
+     TF_ASSIGN_OR_RETURN(BufferAllocation::Slice param_slice,
+                         assignment_.GetUniqueTopLevelSlice(param));
+@@ -152,9 +176,19 @@ StatusOr<llvm::Function*> IrEmitter::EmitComputation(
+   compute_function_.reset();
+   computation_root_allocation_ = BufferAllocation::Slice();
+   computation_parameter_allocations_.clear();
++
++  absl::StrAppend(&wasm_code, ")\n");
++  write_wasm_code();
++
+   return ir_function;
+ }
+ 
++void IrEmitter::write_wasm_code() {
++  std::ofstream wasm_output(wasm_out_file);
++  wasm_output << wasm_code;
++  wasm_output.close();
++}
++
+ void IrEmitter::InitializeIrFunction(const string& function_name) {
+   // Functions with local linkage get an inlining bonus.  Because we know
+   // a-priori that embedded functions (non-entry functions) will not have its
+@@ -954,6 +988,22 @@ Status IrEmitter::HandleDot(HloInstruction* dot) {
+   TF_RETURN_IF_ERROR(EmitTargetAddressForOp(dot));
+   llvm_ir::IrArray target_array = GetIrArrayFor(dot);
+ 
++  llvm::Value* t1 = GetEmittedValueFor(lhs);
++  llvm::Value* t2 = GetEmittedValueFor(rhs);
++
++  absl::StrAppend(&wasm_code, "get_local $", lhs->name(), "\n");
++
++  for (auto dim : lhs->shape().dimensions()) {
++    absl::StrAppend(&wasm_code, "i32.const ", dim, "\n");
++  }
++
++  absl::StrAppend(&wasm_code, "get_local $", rhs->name(), "\n");
++  for (auto dim : rhs->shape().dimensions()) {
++    absl::StrAppend(&wasm_code, "i32.const ", dim, "\n");
++  }
++
++  absl::StrAppend(&wasm_code, "call $matmul_f32\n");
++
+   VLOG(2) << "HandleDot: ";
+   VLOG(2) << "  lhs operand: "
+           << llvm_ir::DumpToString(*lhs_array.GetBasePointer());
+@@ -2898,6 +2948,24 @@ Status IrEmitter::EmitTargetElementLoop(
+     const llvm_ir::ElementGenerator& element_generator) {
+   VLOG(2) << "EmitTargetElementLoop: " << target_op->ToString();
+ 
++  if (target_op->name().substr(0, 3) == "add") {
++    auto lhs = target_op->operand(0);
++    auto rhs = target_op->operand(1);
++
++    absl::StrAppend(&wasm_code, "get_local $", lhs->name(), "\n");
++
++    for (auto dim : lhs->shape().dimensions()) {
++      absl::StrAppend(&wasm_code, "i32.const ", dim, "\n");
++    }
++
++    absl::StrAppend(&wasm_code, "get_local $", rhs->name(), "\n");
++    for (auto dim : rhs->shape().dimensions()) {
++      absl::StrAppend(&wasm_code, "i32.const ", dim, "\n");
++    }
++
++    absl::StrAppend(&wasm_code, "call $matadd_f32\n");
++  }
++
+   const Shape& target_shape = target_op->shape();
+   TF_RETURN_IF_ERROR(EmitTargetAddressForOp(target_op));
+   llvm_ir::IrArray target_array = GetIrArrayFor(target_op);
+diff --git a/tensorflow/compiler/xla/service/cpu/ir_emitter.h b/tensorflow/compiler/xla/service/cpu/ir_emitter.h
+index 586f27b..7155859 100644
+--- a/tensorflow/compiler/xla/service/cpu/ir_emitter.h
++++ b/tensorflow/compiler/xla/service/cpu/ir_emitter.h
+@@ -23,6 +23,8 @@ limitations under the License.
+ #include <unordered_map>
+ #include <vector>
+ 
++#include <fstream>
++
+ #include "absl/container/flat_hash_map.h"
+ #include "absl/strings/string_view.h"
+ #include "absl/types/span.h"
+@@ -578,6 +580,11 @@ class IrEmitter : public DfsHloVisitorWithDefault,
+   std::vector<const HloComputation*> global_computations_;
+ 
+   TF_DISALLOW_COPY_AND_ASSIGN(IrEmitter);
++
++  // WASM code generation
++  std::string wasm_code;
++  const std::string wasm_out_file = "./wasm_code.wat";
++  void write_wasm_code();
+ };
+ 
+ }  // namespace cpu
